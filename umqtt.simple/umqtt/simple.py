@@ -7,12 +7,16 @@ class MQTTException(Exception):
 
 class MQTTClient:
 
-    def __init__(self, client_id, server, port=0, user=None, password=None, keepalive=0,
-                 ssl=False, ssl_params={}):
+    def __init__(self, client_id, sock=None, server=None, port=0, user=None, password=None,
+                 keepalive=0, ssl=False, ssl_params={}):
+        if sock and server:
+            raise ValueError('Socket and server are mutually exclusive')
+        if not server and not socket:
+            raise ValueError('Either socket or server must be specified')
         if port == 0:
             port = 8883 if ssl else 1883
         self.client_id = client_id
-        self.sock = None
+        self.sock = sock
         self.server = server
         self.port = port
         self.ssl = ssl
@@ -28,8 +32,11 @@ class MQTTClient:
         self.lw_retain = False
 
     def _send_str(self, s):
-        self.sock.write(struct.pack("!H", len(s)))
-        self.sock.write(s)
+        to_send = bytearray()
+        to_send += struct.pack("!H", len(s))
+        to_send += s
+
+        return to_send
 
     def _recv_len(self):
         n = 0
@@ -53,12 +60,13 @@ class MQTTClient:
         self.lw_retain = retain
 
     def connect(self, clean_session=True):
-        self.sock = socket.socket()
-        addr = socket.getaddrinfo(self.server, self.port)[0][-1]
-        self.sock.connect(addr)
-        if self.ssl:
-            import ussl
-            self.sock = ussl.wrap_socket(self.sock, **self.ssl_params)
+        if not self.sock:
+            self.sock = socket.socket()
+            addr = socket.getaddrinfo(self.server, self.port)[0][-1]
+            self.sock.connect(addr)
+            if self.ssl:
+                import ussl
+                self.sock = ussl.wrap_socket(self.sock, **self.ssl_params)
         premsg = bytearray(b"\x10\0\0\0\0\0")
         msg = bytearray(b"\x04MQTT\x04\x02\0\0")
 
@@ -83,16 +91,19 @@ class MQTTClient:
             i += 1
         premsg[i] = sz
 
-        self.sock.write(premsg, i + 2)
-        self.sock.write(msg)
+        to_send = bytearray()
+        to_send += premsg[:i + 2]
+        to_send += msg
         #print(hex(len(msg)), hexlify(msg, ":"))
-        self._send_str(self.client_id)
+        to_send += self._send_str(self.client_id)
         if self.lw_topic:
-            self._send_str(self.lw_topic)
-            self._send_str(self.lw_msg)
+            to_send += self._send_str(self.lw_topic)
+            to_send += self._send_str(self.lw_msg)
         if self.user is not None:
-            self._send_str(self.user)
-            self._send_str(self.pswd)
+            to_send += self._send_str(self.user)
+            to_send += self._send_str(self.pswd)
+        self.sock.ioctl(0x09, 0x2)
+        self.sock.write(to_send)
         resp = self.sock.read(4)
         assert resp[0] == 0x20 and resp[1] == 0x02
         if resp[3] != 0:
@@ -100,10 +111,12 @@ class MQTTClient:
         return resp[2] & 1
 
     def disconnect(self):
+        self.sock.ioctl(0x09, 0x2)
         self.sock.write(b"\xe0\0")
         self.sock.close()
 
     def ping(self):
+        self.sock.ioctl(0x09, 0x2)
         self.sock.write(b"\xc0\0")
 
     def publish(self, topic, msg, retain=False, qos=0):
@@ -120,14 +133,18 @@ class MQTTClient:
             i += 1
         pkt[i] = sz
         #print(hex(len(pkt)), hexlify(pkt, ":"))
-        self.sock.write(pkt, i + 1)
-        self._send_str(topic)
+
+        to_send = bytearray()
+        to_send += pkt[:i + 1]
+        to_send += self._send_str(topic)
         if qos > 0:
             self.pid += 1
             pid = self.pid
             struct.pack_into("!H", pkt, 0, pid)
-            self.sock.write(pkt, 2)
-        self.sock.write(msg)
+            to_send += pkt[:2]
+        to_send += msg
+        self.sock.ioctl(0x09, 0x2)
+        self.sock.write(to_send)
         if qos == 1:
             while 1:
                 op = self.wait_msg()
@@ -147,9 +164,13 @@ class MQTTClient:
         self.pid += 1
         struct.pack_into("!BH", pkt, 1, 2 + 2 + len(topic) + 1, self.pid)
         #print(hex(len(pkt)), hexlify(pkt, ":"))
-        self.sock.write(pkt)
-        self._send_str(topic)
-        self.sock.write(qos.to_bytes(1, "little"))
+
+        to_send = bytearray()
+        to_send += pkt
+        to_send += self._send_str(topic)
+        to_send += qos.to_bytes(1, "little")
+        self.sock.ioctl(0x09, 0x2)
+        self.sock.write(to_send)
         while 1:
             op = self.wait_msg()
             if op == 0x90:
@@ -166,7 +187,7 @@ class MQTTClient:
     # messages processed internally.
     def wait_msg(self):
         res = self.sock.read(1)
-        self.sock.setblocking(True)
+        self.sock.ioctl(0xFF, 0x80)
         if res is None:
             return None
         if res == b"":
@@ -192,6 +213,7 @@ class MQTTClient:
         if op & 6 == 2:
             pkt = bytearray(b"\x40\x02\0\0")
             struct.pack_into("!H", pkt, 2, pid)
+            self.sock.ioctl(0x09, 0x2)
             self.sock.write(pkt)
         elif op & 6 == 4:
             assert 0
@@ -200,5 +222,5 @@ class MQTTClient:
     # If not, returns immediately with None. Otherwise, does
     # the same processing as wait_msg.
     def check_msg(self):
-        self.sock.setblocking(False)
+        self.sock.ioctl(0xFF, 0x00)
         return self.wait_msg()
